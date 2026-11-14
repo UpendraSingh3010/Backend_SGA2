@@ -1,0 +1,10 @@
+{
+  "spec": "test/**/*.test.js",
+  "require": "test/hooks.js",
+  "timeout": 20000,
+  "exit": true,
+  "reporter": "spec",
+  "node-option": [
+    "disable-warning=DEP0060"
+  ]
+}

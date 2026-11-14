@@ -1,0 +1,1262 @@
+openapi: 3.0.3
+info:
+  title: Fleet Management System API
+  version: 1.0.0
+  description: |
+    REST API for monitoring a vehicle fleet: vehicle registry, GPS telemetry, geolocation
+    (OpenStreetMap), SMS notifications and user management.
+
+    All requests go through the **API Gateway**, which forwards them to the backend services:
+
+    | Gateway route | Target service |
+    |---|---|
+    | `/api/users/*` | User Service |
+    | `/api/vehicles/*` | Vehicle/Fleet Service |
+    | `/api/telemetry/*` | Telemetry Service |
+    | `/api/maps/*` | Geolocation Service |
+    | `/api/notifications/*` | Notification Service |
+
+    ## Authentication
+    Every `/api/*` request needs **two** credentials:
+    1. **API key** (`x-api-key` header). It identifies the client application and is checked by the gateway.
+       Missing key → `401 API_KEY_MISSING`, wrong key → `403 API_KEY_INVALID`.
+    2. **JWT bearer token** (`Authorization: Bearer <token>`). It identifies the user and is checked by each service.
+       Get one from `POST /api/users/login`. Only register and login work without a JWT.
+
+    In Swagger UI, click **Authorize**, enter the API key (default `dev-api-key-123`) and paste the
+    `token` returned by login.
+
+    ## Roles (RBAC)
+    | Role | Can do |
+    |---|---|
+    | `admin` | Everything, including deleting vehicles and managing users |
+    | `fleet_manager` | Register/update vehicles, change status, view notifications |
+    | `driver` | Read vehicles; submit telemetry and change status **only for their assigned vehicle** |
+
+    ## Rate limiting
+    The gateway allows **100 requests per 60 seconds per API key** (configurable). Every response
+    carries `RateLimit` / `RateLimit-Policy` headers; when the limit is exceeded the gateway
+    returns `429 RATE_LIMIT_EXCEEDED`.
+
+    ## Errors
+    Every error uses the same shape (see the `Error` schema). Gateway-level errors: `401/403` API key,
+    `404 NO_ROUTE`, `429` rate limit, `503 SERVICE_UNAVAILABLE` when the target service is down,
+    `504 GATEWAY_TIMEOUT` when it does not answer in time.
+
+    ## Demo accounts (seed data)
+    `admin@fleet.local / Admin@123`, `manager@fleet.local / Manager@123`, `driver1@fleet.local / Driver@123`
+servers:
+  - url: /
+    description: This API Gateway
+tags:
+  - name: Gateway
+    description: Gateway health (no API key required)
+  - name: Users
+    description: User Service - login, JWT verification and user management
+  - name: Vehicles
+    description: Vehicle/Fleet Service - registration, retrieval, status changes
+  - name: Telemetry
+    description: Telemetry Service - GPS + sensor data and critical events
+  - name: Maps
+    description: Geolocation Service - geocoding (OpenStreetMap Nominatim) and nearby search
+  - name: Notifications
+    description: Notification Service - SMS alerts and delivery records
+
+security:
+  - ApiKeyAuth: []
+    BearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [Gateway]
+      summary: Gateway and backend service health
+      security: []
+      responses:
+        '200':
+          description: All services are up
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+              example:
+                gateway: up
+                status: healthy
+                services:
+                  users: { status: up, latencyMs: 3 }
+                  vehicles: { status: up, latencyMs: 2 }
+                  telemetry: { status: up, latencyMs: 2 }
+                  maps: { status: up, latencyMs: 2 }
+                  notifications: { status: up, latencyMs: 2 }
+                timestamp: '2026-11-13T10:00:00.000Z'
+        '503':
+          description: One or more services are down (status `degraded`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+
+  # ---------------------------------------------------------------- Users
+  /api/users/register:
+    post:
+      tags: [Users]
+      summary: Self-register a driver account
+      description: Public endpoint (API key only). Always creates a `driver`. Admins create other roles with `POST /api/users`.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+            example: { name: Ravi Kumar, email: ravi@example.com, password: Secret@123, phone: '+919812345678' }
+      responses:
+        '201':
+          description: Driver account created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/ApiKeyMissing' }
+        '403': { $ref: '#/components/responses/ApiKeyInvalid' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/users/login:
+    post:
+      tags: [Users]
+      summary: Log in and receive a JWT
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+            examples:
+              admin: { summary: Admin, value: { email: admin@fleet.local, password: Admin@123 } }
+              manager: { summary: Fleet manager, value: { email: manager@fleet.local, password: Manager@123 } }
+              driver: { summary: Driver, value: { email: driver1@fleet.local, password: Driver@123 } }
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+              example:
+                token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI2NzMw...
+                tokenType: Bearer
+                expiresIn: 1h
+                user: { id: 6730f0c2a1b2c3d4e5f60789, name: Asha Admin, email: admin@fleet.local, role: admin, phone: '+919800000001', notificationsEnabled: true, active: true }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Wrong email or password (or missing API key)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: { status: 401, code: INVALID_CREDENTIALS, message: Invalid email or password } }
+        '403': { $ref: '#/components/responses/ApiKeyInvalid' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/users/verify-token:
+    get:
+      tags: [Users]
+      summary: Verify a JWT and return its claims
+      responses:
+        '200':
+          description: Token is valid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VerifyTokenResponse' }
+              example:
+                valid: true
+                claims: { sub: 6730f0c2a1b2c3d4e5f60789, role: admin, name: Asha Admin, email: admin@fleet.local, iss: fleet-users-service }
+                issuedAt: '2026-11-13T10:00:00.000Z'
+                expiresAt: '2026-11-13T11:00:00.000Z'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/users/me:
+    get:
+      tags: [Users]
+      summary: Current user's profile
+      responses:
+        '200':
+          description: The logged-in user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/users:
+    get:
+      tags: [Users]
+      summary: List users
+      description: 'Roles: `admin`, `fleet_manager`'
+      parameters:
+        - { name: role, in: query, schema: { $ref: '#/components/schemas/Role' } }
+      responses:
+        '200':
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/User' } }
+                  total: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Users]
+      summary: Create a user with any role
+      description: 'Role: `admin`'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/RegisterRequest'
+                - type: object
+                  properties:
+                    role: { $ref: '#/components/schemas/Role' }
+            example: { name: Farah Manager, email: farah@fleet.local, password: Manager@123, phone: '+919811112222', role: fleet_manager }
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    get:
+      tags: [Users]
+      summary: Get a user
+      description: 'Roles: `admin`, `fleet_manager`'
+      responses:
+        '200':
+          description: The user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Users]
+      summary: Update a user (role, phone, notifications, active)
+      description: 'Role: `admin`'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                phone: { type: string, example: '+919800000009' }
+                role: { $ref: '#/components/schemas/Role' }
+                notificationsEnabled: { type: boolean }
+                active: { type: boolean }
+      responses:
+        '200':
+          description: Updated user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Vehicles
+  /api/vehicles:
+    post:
+      tags: [Vehicles]
+      summary: Register a vehicle
+      description: |
+        Roles: `admin`, `fleet_manager`.
+        The location comes from `latitude`/`longitude` if given. Otherwise the `address` is
+        geocoded by the Geolocation Service (OpenStreetMap). If geocoding fails the vehicle is
+        still registered and `geocoding.success` is `false`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VehicleCreateRequest' }
+            examples:
+              byAddress:
+                summary: Location from address (geocoded)
+                value: { registrationNumber: DL10XY4321, make: Tata, model: Intra V30, year: 2023, type: truck, address: 'Connaught Place, New Delhi' }
+              byCoordinates:
+                summary: Location from GPS coordinates
+                value: { registrationNumber: HR26ZZ1111, make: Mahindra, model: Supro, year: 2022, type: van, latitude: 28.4595, longitude: 77.0266 }
+      responses:
+        '201':
+          description: Vehicle registered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VehicleCreateResponse' }
+              example:
+                vehicle:
+                  id: 6730f1d2a1b2c3d4e5f60800
+                  registrationNumber: DL10XY4321
+                  make: Tata
+                  model: Intra V30
+                  year: 2023
+                  type: truck
+                  status: idle
+                  address: 'Connaught Place, New Delhi'
+                  location: { type: Point, coordinates: [77.2195, 28.6328] }
+                  position: { lat: 28.6328, lng: 77.2195 }
+                  locationSource: geocoded
+                  statusHistory: []
+                  createdAt: '2026-11-13T10:00:00.000Z'
+                  updatedAt: '2026-11-13T10:00:00.000Z'
+                geocoding: { success: true, lat: 28.6328, lng: 77.2195, displayName: 'Connaught Place, Delhi, India', provider: nominatim }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    get:
+      tags: [Vehicles]
+      summary: List vehicles
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/VehicleStatus' } }
+        - { name: type, in: query, schema: { $ref: '#/components/schemas/VehicleType' } }
+        - { name: search, in: query, description: Matches registration number, make or model, schema: { type: string } }
+        - { name: mine, in: query, description: Drivers only - just my assigned vehicles, schema: { type: boolean } }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Paginated vehicles
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginated'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Vehicle' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/vehicles/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    get:
+      tags: [Vehicles]
+      summary: Get a vehicle
+      responses:
+        '200':
+          description: The vehicle
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vehicle: { $ref: '#/components/schemas/Vehicle' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Vehicles]
+      summary: Update vehicle details
+      description: 'Roles: `admin`, `fleet_manager`. Use `/status` to change the operational status.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VehicleUpdateRequest' }
+            example: { model: Intra V50, address: 'Saket, New Delhi' }
+      responses:
+        '200':
+          description: Updated vehicle
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VehicleCreateResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Vehicles]
+      summary: Delete a vehicle
+      description: 'Role: **`admin` only**. Fleet managers and drivers get `403 INSUFFICIENT_ROLE`.'
+      responses:
+        '204': { description: Vehicle deleted }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Caller is not an admin
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: { status: 403, code: INSUFFICIENT_ROLE, message: "Role 'driver' is not allowed to perform this action. Allowed roles: admin" } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/vehicles/{id}/status:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    patch:
+      tags: [Vehicles]
+      summary: Change operational status (sends SMS notifications)
+      description: |
+        Roles: `admin`, `fleet_manager`, or the `driver` assigned to the vehicle.
+        When the status actually changes, the Notification Service texts all admins,
+        fleet managers and the assigned driver. The response summarises the result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StatusUpdateRequest' }
+            example: { status: maintenance, reason: Scheduled brake inspection }
+      responses:
+        '200':
+          description: Status updated (or unchanged, `statusChanged:false`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatusUpdateResponse' }
+              example:
+                vehicle: { id: 6730f1d2a1b2c3d4e5f60800, registrationNumber: DL01AB1234, status: maintenance }
+                statusChanged: true
+                previousStatus: active
+                notification: { triggered: true, total: 4, sent: 3, failed: 1 }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- Telemetry
+  /api/telemetry:
+    post:
+      tags: [Telemetry]
+      summary: Submit a telemetry reading (GPS + sensors)
+      description: |
+        Stores the reading and updates the vehicle's current GPS position.
+        A **critical event** is raised when the vehicle reports `engine_fault`, `low_battery` or
+        `emergency_stop`, **or** when it is detected automatically (battery below 15%, engine above
+        110°C, or any `faultCode`). Critical events send an SMS to every fleet administrator.
+        Drivers may only submit for their assigned vehicle.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TelemetryRequest' }
+            examples:
+              normal:
+                summary: Normal GPS fix
+                value: { vehicleId: 6730f1d2a1b2c3d4e5f60800, latitude: 28.6139, longitude: 77.209, speedKmh: 42, heading: 90, batteryLevel: 76, fuelLevel: 55, engineTempC: 88 }
+              engineFault:
+                summary: Engine fault (critical)
+                value: { vehicleId: 6730f1d2a1b2c3d4e5f60800, latitude: 28.6139, longitude: 77.209, speedKmh: 0, engineTempC: 121, faultCode: P0217, event: engine_fault }
+              emergencyStop:
+                summary: Emergency stop (critical)
+                value: { vehicleId: 6730f1d2a1b2c3d4e5f60800, latitude: 28.62, longitude: 77.21, speedKmh: 0, events: [emergency_stop] }
+      responses:
+        '201':
+          description: Telemetry stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TelemetrySubmitResponse' }
+              example:
+                telemetry:
+                  id: 6730f2e3a1b2c3d4e5f60900
+                  vehicle: 6730f1d2a1b2c3d4e5f60800
+                  registrationNumber: DL01AB1234
+                  recordedAt: '2026-11-13T10:05:00.000Z'
+                  location: { type: Point, coordinates: [77.209, 28.6139] }
+                  position: { lat: 28.6139, lng: 77.209 }
+                  speedKmh: 0
+                  engineTempC: 121
+                  faultCode: P0217
+                  events: [engine_fault]
+                criticalEvents: [engine_fault]
+                notification: { triggered: true, total: 2, sent: 1, failed: 1 }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/telemetry/vehicles/{vehicleId}:
+    get:
+      tags: [Telemetry]
+      summary: Telemetry history for a vehicle (newest first)
+      parameters:
+        - { name: vehicleId, in: path, required: true, schema: { $ref: '#/components/schemas/ObjectId' } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+      responses:
+        '200':
+          description: Readings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vehicleId: { type: string }
+                  registrationNumber: { type: string }
+                  count: { type: integer }
+                  data: { type: array, items: { $ref: '#/components/schemas/Telemetry' } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/telemetry/vehicles/{vehicleId}/latest:
+    get:
+      tags: [Telemetry]
+      summary: Latest reading for a vehicle
+      parameters:
+        - { name: vehicleId, in: path, required: true, schema: { $ref: '#/components/schemas/ObjectId' } }
+      responses:
+        '200':
+          description: Latest reading
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  telemetry: { $ref: '#/components/schemas/Telemetry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/telemetry/events:
+    get:
+      tags: [Telemetry]
+      summary: Recent critical events
+      description: Drivers must pass their own `vehicleId`.
+      parameters:
+        - { name: event, in: query, schema: { $ref: '#/components/schemas/CriticalEvent' } }
+        - { name: vehicleId, in: query, schema: { $ref: '#/components/schemas/ObjectId' } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        '200':
+          description: Readings that contain critical events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+                  data: { type: array, items: { $ref: '#/components/schemas/Telemetry' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---------------------------------------------------------------- Maps
+  /api/maps/geocode:
+    get:
+      tags: [Maps]
+      summary: Address → coordinates (OpenStreetMap Nominatim)
+      parameters:
+        - { name: address, in: query, required: true, schema: { type: string }, example: 'India Gate, New Delhi' }
+      responses:
+        '200':
+          description: Coordinates found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GeocodeResult' }
+              example: { address: 'India Gate, New Delhi', lat: 28.6129, lng: 77.2295, displayName: 'India Gate, Kartavya Path, New Delhi, Delhi, 110001, India', provider: nominatim }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Address not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: { status: 404, code: ADDRESS_NOT_FOUND, message: "No coordinates found for address 'zzzz'" } }
+        '502':
+          description: Geocoding provider unreachable or returned an error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/maps/reverse:
+    get:
+      tags: [Maps]
+      summary: Coordinates → address
+      parameters:
+        - { name: lat, in: query, required: true, schema: { type: number }, example: 28.6129 }
+        - { name: lng, in: query, required: true, schema: { type: number }, example: 77.2295 }
+      responses:
+        '200':
+          description: Address found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GeocodeResult' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/maps/nearby:
+    get:
+      tags: [Maps]
+      summary: Vehicles within X km of a location
+      description: |
+        Give the centre either as `lat` + `lng` or as an `address` (which is geocoded first).
+        Uses MongoDB `$geoNear` on a 2dsphere index. Results are sorted nearest first and include `distanceKm`.
+      parameters:
+        - { name: lat, in: query, schema: { type: number }, example: 28.6129 }
+        - { name: lng, in: query, schema: { type: number }, example: 77.2295 }
+        - { name: address, in: query, schema: { type: string }, description: Used when lat/lng are not given }
+        - { name: radiusKm, in: query, schema: { type: number, default: 5, minimum: 0.001, maximum: 500 } }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/VehicleStatus' } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+      responses:
+        '200':
+          description: Nearby vehicles
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NearbyResponse' }
+              example:
+                center: { lat: 28.6129, lng: 77.2295, source: coordinates }
+                radiusKm: 5
+                count: 2
+                vehicles:
+                  - { id: 6730f1d2a1b2c3d4e5f60801, registrationNumber: DL03CD5678, make: Mahindra, model: Bolero Pickup, status: active, position: { lat: 28.6129, lng: 77.2295 }, distanceKm: 0 }
+                  - { id: 6730f1d2a1b2c3d4e5f60800, registrationNumber: DL01AB1234, make: Tata, model: Ace Gold, status: active, position: { lat: 28.6315, lng: 77.2167 }, distanceKm: 2.419 }
+        '400':
+          description: Missing/invalid centre or radius
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: { status: 400, code: INVALID_RADIUS, message: radiusKm must be a number greater than 0 and at most 500 } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/maps/vehicles:
+    get:
+      tags: [Maps]
+      summary: All vehicle positions as GeoJSON (for map display)
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/VehicleStatus' } }
+      responses:
+        '200':
+          description: GeoJSON FeatureCollection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FeatureCollection' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------------------------------------------------------- Notifications
+  /api/notifications:
+    get:
+      tags: [Notifications]
+      summary: Notification delivery records
+      description: 'Roles: `admin`, `fleet_manager`'
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending, sent, failed] } }
+        - { name: type, in: query, schema: { type: string, enum: [critical_event, status_change, manual] } }
+        - { name: vehicleId, in: query, schema: { $ref: '#/components/schemas/ObjectId' } }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Notifications (newest first)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginated'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Notification' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/notifications/stats:
+    get:
+      tags: [Notifications]
+      summary: Counts by status and type
+      description: 'Roles: `admin`, `fleet_manager`'
+      responses:
+        '200':
+          description: Statistics
+          content:
+            application/json:
+              example: { total: 6, byStatus: { pending: 0, sent: 4, failed: 2 }, byType: { critical_event: 2, status_change: 4 }, provider: stub }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/notifications/outbox:
+    get:
+      tags: [Notifications]
+      summary: Messages accepted by the SMS stub
+      description: "Role: `admin`. Shows what the recipients' phones would have received (stub provider only)."
+      responses:
+        '200':
+          description: Outbox
+          content:
+            application/json:
+              example: { provider: stub, messages: [{ id: SM_STUB_1c2d..., to: '+919800000001', body: '[FLEET ALERT] ENGINE FAULT reported by DL01AB1234 ...', at: '2026-11-13T10:05:00.000Z' }] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/notifications/events:
+    post:
+      tags: [Notifications]
+      summary: Raise a vehicle event (internal / admin)
+      description: |
+        Normally called by the Telemetry and Vehicle services with the internal service key.
+        Admins can call it directly to test notifications. Recipients:
+        - `critical_event` → all admins
+        - `status_change` → admins, fleet managers and the assigned driver
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotificationEventRequest' }
+            examples:
+              critical: { value: { type: critical_event, vehicleId: 6730f1d2a1b2c3d4e5f60800, events: [emergency_stop] } }
+              status: { value: { type: status_change, vehicleId: 6730f1d2a1b2c3d4e5f60800, previousStatus: active, newStatus: maintenance, reason: Brake inspection } }
+      responses:
+        '201':
+          description: Notifications attempted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationSummary' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/notifications/sms:
+    post:
+      tags: [Notifications]
+      summary: Send a manual SMS
+      description: 'Role: `admin`. Send to a `phone` number or to a user (`userId`). Numbers ending in `0000` always fail on the stub.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                phone: { type: string, example: '+919800000001' }
+                userId: { $ref: '#/components/schemas/ObjectId' }
+                message: { type: string, example: 'Test message from fleet control room' }
+      responses:
+        '201':
+          description: Notification record (status `sent` or `failed`)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notification: { $ref: '#/components/schemas/Notification' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/notifications/{id}:
+    get:
+      tags: [Notifications]
+      summary: Get a notification
+      description: 'Roles: `admin`, `fleet_manager`'
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Notification
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notification: { $ref: '#/components/schemas/Notification' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/notifications/{id}/retry:
+    post:
+      tags: [Notifications]
+      summary: Retry a failed notification
+      description: 'Role: `admin`'
+      parameters:
+        - $ref: '#/components/parameters/IdPath'
+      responses:
+        '200':
+          description: Retried (check `status` and `attempts`)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notification: { $ref: '#/components/schemas/Notification' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Notification is not in `failed` state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Client API key checked by the gateway (default `dev-api-key-123`).
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT from `POST /api/users/login`. Claims include `sub` (user id) and `role`.
+
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/ObjectId' }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+
+  responses:
+    ValidationError:
+      description: Invalid input
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              status: 400
+              code: VALIDATION_ERROR
+              message: Request validation failed
+              details: [{ field: registrationNumber, message: Path `registrationNumber` is required. }]
+    Unauthorized:
+      description: Missing API key, or missing / invalid / expired JWT
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            missingToken: { value: { error: { status: 401, code: TOKEN_MISSING, message: 'Missing or malformed Authorization header. Expected: Bearer <token>' } } }
+            expiredToken: { value: { error: { status: 401, code: TOKEN_EXPIRED, message: Token has expired } } }
+            missingApiKey: { value: { error: { status: 401, code: API_KEY_MISSING, message: API key is required. Send it in the x-api-key header. } } }
+    Forbidden:
+      description: Invalid API key, or the user's role is not allowed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            role: { value: { error: { status: 403, code: INSUFFICIENT_ROLE, message: "Role 'driver' is not allowed to perform this action. Allowed roles: admin" } } }
+            apiKey: { value: { error: { status: 403, code: API_KEY_INVALID, message: The API key provided is not valid. } } }
+    ApiKeyMissing:
+      description: No `x-api-key` header
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { status: 401, code: API_KEY_MISSING, message: API key is required. Send it in the x-api-key header. } }
+    ApiKeyInvalid:
+      description: Unknown API key
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { status: 403, code: API_KEY_INVALID, message: The API key provided is not valid. } }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { status: 404, code: VEHICLE_NOT_FOUND, message: Vehicle not found } }
+    Conflict:
+      description: Duplicate resource
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { status: 409, code: DUPLICATE_RESOURCE, message: A resource with the same registrationNumber already exists, details: { registrationNumber: DL01AB1234 } } }
+    RateLimited:
+      description: Too many requests for this API key
+      headers:
+        Retry-After: { schema: { type: integer }, description: Seconds until the window resets }
+        RateLimit: { schema: { type: string }, example: 'limit=100, remaining=0, reset=42' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { status: 429, code: RATE_LIMIT_EXCEEDED, message: 'Too many requests: limit is 100 requests per 60s for this API key.', details: { limit: 100, windowSeconds: 60 } } }
+    ServiceUnavailable:
+      description: The target backend service is down
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { status: 503, code: SERVICE_UNAVAILABLE, message: Vehicle/Fleet Service is currently unavailable. Please try again later., details: { service: vehicles } } }
+
+  schemas:
+    ObjectId:
+      type: string
+      pattern: '^[a-f0-9]{24}$'
+      example: 6730f1d2a1b2c3d4e5f60800
+    Role:
+      type: string
+      enum: [admin, fleet_manager, driver]
+    VehicleStatus:
+      type: string
+      enum: [active, idle, maintenance, out_of_service, emergency]
+    VehicleType:
+      type: string
+      enum: [car, van, truck, bus, motorcycle, other]
+    CriticalEvent:
+      type: string
+      enum: [engine_fault, low_battery, emergency_stop]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [status, code, message]
+          properties:
+            status: { type: integer, example: 400 }
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string }
+            details: { description: Extra information (field errors, service name...) }
+            requestId: { type: string, description: Correlation id from the gateway (X-Request-Id) }
+
+    Paginated:
+      type: object
+      properties:
+        page: { type: integer, example: 1 }
+        limit: { type: integer, example: 20 }
+        total: { type: integer, example: 8 }
+
+    GeoPoint:
+      type: object
+      description: GeoJSON point - note the order is [longitude, latitude]
+      properties:
+        type: { type: string, enum: [Point] }
+        coordinates: { type: array, items: { type: number }, minItems: 2, maxItems: 2, example: [77.209, 28.6139] }
+    LatLng:
+      type: object
+      nullable: true
+      properties:
+        lat: { type: number, example: 28.6139 }
+        lng: { type: number, example: 77.209 }
+
+    User:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/ObjectId' }
+        name: { type: string, example: Asha Admin }
+        email: { type: string, format: email, example: admin@fleet.local }
+        role: { $ref: '#/components/schemas/Role' }
+        phone: { type: string, example: '+919800000001' }
+        notificationsEnabled: { type: boolean }
+        active: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    UserResponse:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+    RegisterRequest:
+      type: object
+      required: [name, email, password]
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8, format: password }
+        phone: { type: string, description: E.164 format, example: '+919812345678' }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+    LoginResponse:
+      type: object
+      properties:
+        token: { type: string, description: JWT (HS256) }
+        tokenType: { type: string, example: Bearer }
+        expiresIn: { type: string, example: 1h }
+        user: { $ref: '#/components/schemas/User' }
+    VerifyTokenResponse:
+      type: object
+      properties:
+        valid: { type: boolean }
+        claims:
+          type: object
+          properties:
+            sub: { type: string }
+            role: { $ref: '#/components/schemas/Role' }
+            name: { type: string }
+            email: { type: string }
+            iss: { type: string }
+        issuedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+
+    Vehicle:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/ObjectId' }
+        registrationNumber: { type: string, example: DL01AB1234 }
+        make: { type: string, example: Tata }
+        model: { type: string, example: Ace Gold }
+        year: { type: integer, example: 2022 }
+        type: { $ref: '#/components/schemas/VehicleType' }
+        status: { $ref: '#/components/schemas/VehicleStatus' }
+        address: { type: string }
+        location: { $ref: '#/components/schemas/GeoPoint' }
+        position: { $ref: '#/components/schemas/LatLng' }
+        locationSource: { type: string, enum: [gps, geocoded, manual] }
+        lastSeenAt: { type: string, format: date-time }
+        lastTelemetry:
+          type: object
+          properties:
+            speedKmh: { type: number }
+            batteryLevel: { type: number }
+            fuelLevel: { type: number }
+            engineTempC: { type: number }
+            recordedAt: { type: string, format: date-time }
+        assignedDriver: { $ref: '#/components/schemas/ObjectId' }
+        statusHistory:
+          type: array
+          items:
+            type: object
+            properties:
+              from: { type: string }
+              to: { type: string }
+              reason: { type: string }
+              changedBy: { type: string }
+              changedAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    VehicleCreateRequest:
+      type: object
+      required: [registrationNumber, make, model]
+      properties:
+        registrationNumber: { type: string, pattern: '^[A-Za-z0-9-]{4,15}$', example: DL10XY4321 }
+        make: { type: string }
+        model: { type: string }
+        year: { type: integer, minimum: 1980 }
+        type: { $ref: '#/components/schemas/VehicleType' }
+        status: { $ref: '#/components/schemas/VehicleStatus' }
+        address: { type: string, description: Geocoded if latitude/longitude are not given }
+        latitude: { type: number, minimum: -90, maximum: 90 }
+        longitude: { type: number, minimum: -180, maximum: 180 }
+        assignedDriverId: { $ref: '#/components/schemas/ObjectId' }
+    VehicleUpdateRequest:
+      type: object
+      properties:
+        make: { type: string }
+        model: { type: string }
+        year: { type: integer }
+        type: { $ref: '#/components/schemas/VehicleType' }
+        address: { type: string, description: Re-geocoded when changed }
+        latitude: { type: number }
+        longitude: { type: number }
+        assignedDriverId: { type: string, nullable: true, description: Driver user id, or null to unassign }
+    VehicleCreateResponse:
+      type: object
+      properties:
+        vehicle: { $ref: '#/components/schemas/Vehicle' }
+        geocoding:
+          type: object
+          description: Present when an address was geocoded
+          properties:
+            success: { type: boolean }
+            lat: { type: number }
+            lng: { type: number }
+            displayName: { type: string }
+            provider: { type: string, enum: [nominatim, mock] }
+            message: { type: string, description: Reason when success is false }
+    StatusUpdateRequest:
+      type: object
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/VehicleStatus' }
+        reason: { type: string }
+    StatusUpdateResponse:
+      type: object
+      properties:
+        vehicle: { $ref: '#/components/schemas/Vehicle' }
+        statusChanged: { type: boolean }
+        previousStatus: { $ref: '#/components/schemas/VehicleStatus' }
+        notification: { $ref: '#/components/schemas/NotificationResult' }
+
+    TelemetryRequest:
+      type: object
+      required: [vehicleId, latitude, longitude]
+      properties:
+        vehicleId: { $ref: '#/components/schemas/ObjectId' }
+        latitude: { type: number, minimum: -90, maximum: 90 }
+        longitude: { type: number, minimum: -180, maximum: 180 }
+        recordedAt: { type: string, format: date-time, description: Defaults to now }
+        speedKmh: { type: number, minimum: 0, maximum: 300 }
+        heading: { type: number, minimum: 0, maximum: 360 }
+        batteryLevel: { type: number, minimum: 0, maximum: 100, description: Below 15 raises low_battery }
+        fuelLevel: { type: number, minimum: 0, maximum: 100 }
+        engineTempC: { type: number, description: Above 110 raises engine_fault }
+        odometerKm: { type: number }
+        faultCode: { type: string, description: OBD-II code - raises engine_fault, example: P0217 }
+        event: { $ref: '#/components/schemas/CriticalEvent' }
+        events: { type: array, items: { $ref: '#/components/schemas/CriticalEvent' } }
+    Telemetry:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/ObjectId' }
+        vehicle: { $ref: '#/components/schemas/ObjectId' }
+        registrationNumber: { type: string }
+        recordedAt: { type: string, format: date-time }
+        receivedAt: { type: string, format: date-time }
+        location: { $ref: '#/components/schemas/GeoPoint' }
+        position: { $ref: '#/components/schemas/LatLng' }
+        speedKmh: { type: number }
+        heading: { type: number }
+        batteryLevel: { type: number }
+        fuelLevel: { type: number }
+        engineTempC: { type: number }
+        odometerKm: { type: number }
+        faultCode: { type: string }
+        events: { type: array, items: { $ref: '#/components/schemas/CriticalEvent' } }
+        submittedBy: { $ref: '#/components/schemas/ObjectId' }
+    TelemetrySubmitResponse:
+      type: object
+      properties:
+        telemetry: { $ref: '#/components/schemas/Telemetry' }
+        criticalEvents: { type: array, items: { $ref: '#/components/schemas/CriticalEvent' } }
+        notification: { $ref: '#/components/schemas/NotificationResult' }
+
+    GeocodeResult:
+      type: object
+      properties:
+        address: { type: string }
+        lat: { type: number }
+        lng: { type: number }
+        displayName: { type: string }
+        provider: { type: string, enum: [nominatim, mock] }
+    NearbyResponse:
+      type: object
+      properties:
+        center:
+          type: object
+          properties:
+            lat: { type: number }
+            lng: { type: number }
+            source: { type: string, enum: [coordinates, geocoded] }
+            address: { type: string }
+        radiusKm: { type: number }
+        count: { type: integer }
+        vehicles:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/Vehicle'
+              - type: object
+                properties:
+                  distanceKm: { type: number, example: 2.419 }
+    FeatureCollection:
+      type: object
+      properties:
+        type: { type: string, enum: [FeatureCollection] }
+        features:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, enum: [Feature] }
+              geometry: { $ref: '#/components/schemas/GeoPoint' }
+              properties:
+                type: object
+                properties:
+                  id: { type: string }
+                  registrationNumber: { type: string }
+                  status: { $ref: '#/components/schemas/VehicleStatus' }
+
+    Notification:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/ObjectId' }
+        type: { type: string, enum: [critical_event, status_change, manual] }
+        channel: { type: string, enum: [sms] }
+        recipient:
+          type: object
+          properties:
+            user: { $ref: '#/components/schemas/ObjectId' }
+            name: { type: string }
+            role: { $ref: '#/components/schemas/Role' }
+            phone: { type: string }
+        vehicle: { $ref: '#/components/schemas/ObjectId' }
+        registrationNumber: { type: string }
+        event: { type: string, example: 'active->maintenance' }
+        message: { type: string }
+        status: { type: string, enum: [pending, sent, failed] }
+        provider: { type: string, enum: [stub, twilio] }
+        providerMessageId: { type: string }
+        error: { type: string, description: Failure reason when status is failed }
+        attempts: { type: integer }
+        sentAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+      example:
+        id: 6730f3f4a1b2c3d4e5f60a00
+        type: critical_event
+        channel: sms
+        recipient: { user: 6730f0c2a1b2c3d4e5f60789, name: Asha Admin, role: admin, phone: '+919800000001' }
+        registrationNumber: DL01AB1234
+        event: engine_fault
+        message: '[FLEET ALERT] ENGINE FAULT reported by DL01AB1234 (Tata Ace Gold) at 28.61390,77.20900 on 2026-11-13 10:05 UTC [engine 121C, code P0217]. Please take action.'
+        status: sent
+        provider: stub
+        providerMessageId: SM_STUB_6f1c...
+        attempts: 1
+        sentAt: '2026-11-13T10:05:00.120Z'
+    NotificationResult:
+      type: object
+      properties:
+        triggered: { type: boolean }
+        total: { type: integer }
+        sent: { type: integer }
+        failed: { type: integer }
+        error: { type: string, description: Present if the Notification Service could not be reached }
+    NotificationSummary:
+      allOf:
+        - $ref: '#/components/schemas/NotificationResult'
+        - type: object
+          properties:
+            notifications: { type: array, items: { $ref: '#/components/schemas/Notification' } }
+    NotificationEventRequest:
+      type: object
+      required: [type, vehicleId]
+      properties:
+        type: { type: string, enum: [critical_event, status_change] }
+        vehicleId: { $ref: '#/components/schemas/ObjectId' }
+        events: { type: array, items: { $ref: '#/components/schemas/CriticalEvent' }, description: Required for critical_event }
+        details: { type: object, description: 'Optional context: location, batteryLevel, engineTempC, faultCode, recordedAt' }
+        previousStatus: { $ref: '#/components/schemas/VehicleStatus' }
+        newStatus: { $ref: '#/components/schemas/VehicleStatus' }
+        reason: { type: string }
+
+    HealthResponse:
+      type: object
+      properties:
+        gateway: { type: string, example: up }
+        status: { type: string, enum: [healthy, degraded] }
+        services:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status: { type: string, enum: [up, down] }
+              latencyMs: { type: integer }
+        timestamp: { type: string, format: date-time }

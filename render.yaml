@@ -1,0 +1,33 @@
+# Render Blueprint - deploys the gateway + all 5 services as ONE web service
+# (one Node process; the gateway listens on Render's $PORT and the services on
+# internal localhost ports). See README -> "Deployment".
+services:
+  - type: web
+    name: fleet-management-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # Don't download the in-memory MongoDB binary during the build
+      - key: MONGOMS_DISABLE_POSTINSTALL
+        value: "1"
+      # Your MongoDB Atlas connection string - entered in the Render dashboard
+      - key: MONGODB_URI
+        sync: false
+      # Comma-separated client API keys - entered in the Render dashboard
+      - key: API_KEYS
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: INTERNAL_SERVICE_KEY
+        generateValue: true
+      - key: GEO_PROVIDER
+        value: nominatim
+      - key: SMS_PROVIDER
+        value: stub
+      - key: RATE_LIMIT_MAX
+        value: "100"

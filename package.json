@@ -1,0 +1,54 @@
+{
+  "name": "fleet-management-system",
+  "version": "1.0.0",
+  "description": "Fleet Management System - API Gateway, microservices, OpenStreetMap geolocation, SMS notifications, Swagger docs and Mocha/Chai tests",
+  "main": "src/start-all.js",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node --disable-warning=DEP0060 src/start-all.js",
+    "start:memory": "node --disable-warning=DEP0060 src/start-all.js --memory --seed",
+    "dev": "node --disable-warning=DEP0060 --watch src/start-all.js",
+    "gateway": "node --disable-warning=DEP0060 src/gateway/index.js",
+    "svc:users": "node --disable-warning=DEP0060 src/services/users/index.js",
+    "svc:vehicles": "node --disable-warning=DEP0060 src/services/vehicles/index.js",
+    "svc:telemetry": "node --disable-warning=DEP0060 src/services/telemetry/index.js",
+    "svc:maps": "node --disable-warning=DEP0060 src/services/maps/index.js",
+    "svc:notifications": "node --disable-warning=DEP0060 src/services/notifications/index.js",
+    "seed": "node --disable-warning=DEP0060 scripts/seed.js",
+    "demo": "node --disable-warning=DEP0060 scripts/demo.js",
+    "test": "mocha"
+  },
+  "keywords": [
+    "fleet",
+    "api-gateway",
+    "express",
+    "mongodb",
+    "openstreetmap",
+    "swagger",
+    "mocha"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "chai": "^4.5.0",
+    "mocha": "^10.8.2",
+    "sinon": "^19.0.5",
+    "supertest": "^7.3.2"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^5.3.0",
+    "express-rate-limit": "^7.5.1",
+    "http-proxy-middleware": "^3.0.10",
+    "jsonwebtoken": "^9.0.3",
+    "mongodb-memory-server": "^10.4.3",
+    "mongoose": "^8.24.9",
+    "morgan": "^1.12.1",
+    "swagger-ui-express": "^5.0.1",
+    "yaml": "^2.9.1"
+  }
+}
